@@ -1,547 +1,583 @@
-import telebot
-from telebot import types
+import os
+import re
 import sqlite3
+import logging
 import json
-import requests
 import time
 from datetime import datetime, timedelta
-import threading
-import logging
-import os
+from typing import List, Dict, Optional, Tuple
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from dotenv import load_dotenv
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ==== ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ====
+load_dotenv()
 
-# Конфигурация
-BOT_TOKEN = "8968195774:AAGXr5Ak1ne-QNy75hK__ZMdhco7wnWc2UQ"
-CREATOR_ID = 1022123079
-ADMIN_USER_ID = 1022123079
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CREATOR_ID = int(os.getenv("CREATOR_ID", 0))
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", 0))
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-YUKASSA_SHOP_ID = "01187960"
-YUKASSA_SECRET_KEY = "test_tojfBk8Lz9MkNFNEV3TEUtCAdhGMHCu9YEI4J67MxCc"
+DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")
+FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", 5))
 
-bot = telebot.TeleBot(BOT_TOKEN)
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не задан! Добавь его в переменные окружения на Render.")
 
-# Инициализация базы данных
-def init_db():
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    
-    # Таблица пользователей
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (user_id INTEGER PRIMARY KEY, 
-                  username TEXT, 
-                  first_name TEXT,
-                  last_name TEXT,
-                  registration_date TEXT,
-                  subscription_end TEXT,
-                  is_premium INTEGER DEFAULT 0,
-                  birth_date TEXT,
-                  gender TEXT,
-                  city TEXT,
-                  preferences TEXT)''')
-    
-    # Таблица для матрицы судьбы
-    c.execute('''CREATE TABLE IF NOT EXISTS fate_matrix
-                 (user_id INTEGER,
-                  birth_date TEXT,
-                  matrix_data TEXT,
-                  calculation_date TEXT,
-                  PRIMARY KEY (user_id, birth_date))''')
-    
-    # Таблица для совместимости
-    c.execute('''CREATE TABLE IF NOT EXISTS compatibility
-                 (user_id INTEGER,
-                  partner_birth_date TEXT,
-                  result TEXT,
-                  calculation_date TEXT)''')
-    
-    conn.commit()
-    conn.close()
+# ==== НАСТРОЙКА ЛОГИРОВАНИЯ ====
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger("numerology_bot")
+logger.info("✅ Переменные окружения загружены")
 
-# Функция для расчета матрицы судьбы (упрощенная версия)
-def calculate_fate_matrix(birth_date):
+# ==== БАЗА ДАННЫХ ====
+class Database:
+    def __init__(self, db_path: str = DATABASE_PATH):
+        self.db_path = db_path
+        self.init_database()
+        logger.info(f"✅ База данных инициализирована: {db_path}")
+    
+    def get_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def init_database(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    name TEXT,
+                    birthdate TEXT,
+                    registration_date TEXT,
+                    state TEXT DEFAULT 'idle',
+                    daily_requests INTEGER DEFAULT 0,
+                    last_request_date TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    subscription_type TEXT,
+                    start_date TEXT,
+                    expiry_date TEXT,
+                    payment_status TEXT,
+                    payment_id TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS usage_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    action_type TEXT,
+                    timestamp TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    role TEXT,
+                    content TEXT,
+                    timestamp TEXT
+                )
+            """)
+            conn.commit()
+    
+    def get_user(self, user_id: int):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    
+    def create_user(self, user_id: int, username: str = None):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR IGNORE INTO users (user_id, username, registration_date, last_request_date)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, username, datetime.now().isoformat(), datetime.now().date().isoformat()))
+            conn.commit()
+    
+    def update_user(self, user_id: int, **kwargs):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            fields = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+            values = list(kwargs.values()) + [user_id]
+            cursor.execute(f"UPDATE users SET {fields} WHERE user_id = ?", values)
+            conn.commit()
+    
+    def is_pro_user(self, user_id: int) -> bool:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM subscriptions
+                WHERE user_id = ?
+                AND payment_status = 'succeeded'
+                AND expiry_date > ?
+            """, (user_id, datetime.now().isoformat()))
+            return cursor.fetchone() is not None
+    
+    def log_action(self, user_id: int, action_type: str):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO usage_stats (user_id, action_type, timestamp) VALUES (?, ?, ?)",
+                           (user_id, action_type, datetime.now().isoformat()))
+            conn.commit()
+
+db = Database()
+
+# ==== НУМЕРОЛОГИЧЕСКИЕ ФУНКЦИИ ====
+def digit_sum(number: int) -> int:
+    return sum(int(d) for d in str(number))
+
+def reduce_to_1_9(number: int, preserve_master: bool = False) -> int:
+    while number > 9:
+        if preserve_master and number in [11, 22, 33]:
+            return number
+        number = digit_sum(number)
+    return number if number != 0 else 9
+
+def parse_date(text: str):
+    text = text.strip()
+    pattern = r'^(\d{2})\.(\d{2})\.(\d{4})$'
+    match = re.match(pattern, text)
+    if not match:
+        return None
     try:
-        # Парсим дату
-        parts = birth_date.split('.')
-        if len(parts) != 3:
-            return None
-        
-        day = int(parts[0])
-        month = int(parts[1])
-        year = int(parts[2])
-        
-        # Суммируем все цифры даты рождения
-        date_str = birth_date.replace('.', '')
-        total_sum = sum(int(digit) for digit in date_str)
-        
-        # Пока сумма > 22, складываем цифры (в нумерологии)
-        while total_sum > 22:
-            total_sum = sum(int(digit) for digit in str(total_sum))
-        
-        if total_sum == 0:
-            total_sum = 22
-        
-        return {
-            'main_number': total_sum,
-            'personality_number': sum(int(digit) for digit in str(day)) if day > 9 else day,
-            'soul_number': sum(int(digit) for digit in str(month)) if month > 9 else month,
-            'destiny_number': sum(int(digit) for digit in str(year)) if year > 9 else year,
-            'mission': describe_mission(total_sum),
-            'strengths': get_strengths(total_sum),
-            'challenges': get_challenges(total_sum)
-        }
-    except Exception as e:
-        logger.error(f"Ошибка расчета матрицы: {e}")
+        return datetime.strptime(text, "%d.%m.%Y")
+    except ValueError:
         return None
 
-def describe_mission(number):
-    descriptions = {
-        1: "Ваша миссия - быть лидером и первооткрывателем. Вы должны идти своим путем и вдохновлять других.",
-        2: "Ваша миссия - создавать гармонию и баланс. Вы должны учиться сотрудничеству и дипломатии.",
-        3: "Ваша миссия - приносить радость и вдохновение. Вы должны развивать свои творческие способности.",
-        4: "Ваша миссия - строить прочные основы. Вы должны быть трудолюбивым и надежным.",
-        5: "Ваша миссия - исследовать мир и делиться знаниями. Вы должны быть свободолюбивым и любознательным.",
-        6: "Ваша миссия - заботиться о других. Вы должны быть ответственным и любящим.",
-        7: "Ваша миссия - искать истину. Вы должны быть мудрым и аналитичным.",
-        8: "Ваша миссия - достигать успеха. Вы должны быть решительным и амбициозным.",
-        9: "Ваша миссия - помогать другим. Вы должны быть сострадательным и альтруистичным.",
-        10: "Ваша миссия - быть проводником перемен. Вы должны быть инициативным и смелым.",
-        11: "Ваша миссия - быть духовным учителем. Вы должны быть вдохновляющим и просветленным.",
-        12: "Ваша миссия - служить примером. Вы должны быть терпеливым и понимающим.",
-        13: "Ваша миссия - трансформировать. Вы должны быть сильным и решительным.",
-        14: "Ваша миссия - объединять. Вы должны быть общительным и дипломатичным.",
-        15: "Ваша миссия - любить. Вы должны быть нежным и заботливым.",
-        16: "Ваша миссия - быть стражем. Вы должны быть защитником и хранителем.",
-        17: "Ваша миссия - быть лидером. Вы должны быть решительным и целеустремленным.",
-        18: "Ваша миссия - быть наставником. Вы должны быть мудрым и поучающим.",
-        19: "Ваша миссия - быть светом. Вы должны быть ярким и вдохновляющим.",
-        20: "Ваша миссия - быть миротворцем. Вы должны быть гармоничным и сбалансированным.",
-        21: "Ваша миссия - быть творцом. Вы должны быть созидательным и инновационным.",
-        22: "Ваша миссия - быть строителем. Вы должны быть основательным и практичным."
-    }
-    return descriptions.get(number, f"Ваша миссия связана с числом {number}")
+def consciousness_number(day: int) -> int:
+    return reduce_to_1_9(digit_sum(day))
 
-def get_strengths(number):
-    strengths = {
-        1: ["Лидерство", "Смелость", "Инновационность"],
-        2: ["Дипломатичность", "Интуиция", "Терпение"],
-        3: ["Креативность", "Оптимизм", "Общительность"],
-        4: ["Надежность", "Трудолюбие", "Практичность"],
-        5: ["Адаптивность", "Любознательность", "Свободолюбие"],
-        6: ["Ответственность", "Заботливость", "Гармоничность", "Красота"],
-        7: ["Мудрость", "Аналитический ум", "Интуиция"],
-        8: ["Амбициозность", "Решительность", "Управленческие навыки"],
-        9: ["Сострадание", "Альтруизм", "Широта взглядов"],
-        10: ["Инициативность", "Харизма", "Смелость"],
-        11: ["Духовность", "Вдохновение", "Проницательность"],
-        12: ["Терпеливость", "Понимание", "Гибкость"],
-        13: ["Сила воли", "Решительность", "Стойкость"],
-        14: ["Коммуникабельность", "Умение слушать", "Дипломатичность"],
-        15: ["Любовь", "Нежность", "Забота"],
-        16: ["Защита", "Храбрость", "Верность"],
-        17: ["Лидерство", "Целеустремленность", "Энтузиазм"],
-        18: ["Мудрость", "Опыт", "Наставничество"],
-        19: ["Яркость", "Оптимизм", "Вдохновение"],
-        20: ["Гармония", "Миролюбие", "Баланс"],
-        21: ["Творчество", "Новаторство", "Идеализм"],
-        22: ["Практичность", "Основательность", "Сила"]
-    }
-    return strengths.get(number, ["Мудрость", "Интуиция", "Внутренняя сила"])
+def mission_number(d: datetime) -> int:
+    total = digit_sum(d.day) + digit_sum(d.month) + digit_sum(d.year)
+    return reduce_to_1_9(total, preserve_master=True)
 
-def get_challenges(number):
-    challenges = {
-        1: ["Излишняя самоуверенность", "Одиночество", "Трудности с командной работой"],
-        2: ["Неуверенность", "Зависимость от других", "Трудности с принятием решений"],
-        3: ["Поверхностность", "Неспособность доводить дела до конца", "Эмоциональная нестабильность"],
-        4: ["Консерватизм", "Сложности с адаптацией", "Чрезмерная серьезность"],
-        5: ["Непостоянство", "Безответственность", "Трудности с обязательствами"],
-        6: ["Излишняя требовательность", "Контроль", "Тревожность"],
-        7: ["Изоляция", "Склонность к анализу", "Эмоциональная закрытость"],
-        8: ["Жестокость", "Материализм", "Властность"],
-        9: ["Жертвенность", "Иллюзии", "Разочарования"],
-        10: ["Импульсивность", "Рискованность", "Непостоянство"],
-        11: ["Идеализация", "Эмоциональная чувствительность", "Склонность к иллюзиям"],
-        12: ["Пассивность", "Склонность к жертвенности", "Заниженная самооценка"],
-        13: ["Склонность к депрессии", "Жесткость", "Трудности с прощением"],
-        14: ["Зависимость от мнения", "Склонность к манипуляциям", "Непостоянство"],
-        15: ["Склонность к зависимостям", "Излишняя чувствительность", "Ревность"],
-        16: ["Излишняя подозрительность", "Склонность к одиночеству", "Неумение доверять"],
-        17: ["Склонность к диктатуре", "Нетерпимость", "Гордыня"],
-        18: ["Излишняя строгость", "Склонность к критике", "Трудности с прощением"],
-        19: ["Склонность к депрессии", "Излишняя требовательность", "Разочарование в людях"],
-        20: ["Излишняя мягкость", "Склонность к жертвенности", "Трудности с границами"],
-        21: ["Склонность к иллюзиям", "Неумение принимать реальность", "Излишняя идеализация"],
-        22: ["Склонность к контролю", "Излишняя серьезность", "Трудности с расслаблением"]
-    }
-    return challenges.get(number, ["Требуется работа над собой", "Личностный рост", "Саморазвитие"])
+def action_number(d: datetime) -> int:
+    return reduce_to_1_9(digit_sum(int(d.strftime("%d%m%Y"))))
 
-# Функция для расчета совместимости
-def calculate_compatibility(birth_date1, birth_date2):
-    matrix1 = calculate_fate_matrix(birth_date1)
-    matrix2 = calculate_fate_matrix(birth_date2)
-    
-    if not matrix1 or not matrix2:
-        return None
-    
-    compatibility_score = (matrix1['main_number'] + matrix2['main_number']) % 10 + 5
-    if compatibility_score > 10:
-        compatibility_score = 10
-    
-    interpretation = {
-        1-3: "Низкая совместимость. Потребуется много работы над отношениями.",
-        4-6: "Средняя совместимость. Хороший потенциал для развития.",
-        7-8: "Высокая совместимость. Отличная пара!",
-        9-10: "Идеальная совместимость. Судьбоносная встреча!"
-    }
-    
-    return {
-        'score': compatibility_score,
-        'interpretation': interpretation.get(compatibility_score, "Уникальная связь, требующая внимания"),
-        'details': f"Число души 1: {matrix1['soul_number']}, Число души 2: {matrix2['soul_number']}"
-    }
+def matrix_counts(d: datetime):
+    date_str = d.strftime("%d%m%Y")
+    counts = {str(i): 0 for i in range(1, 10)}
+    for ch in date_str:
+        if ch in counts:
+            counts[ch] += 1
+    strong = [int(k) for k, v in counts.items() if v > 0]
+    missing = [int(k) for k, v in counts.items() if v == 0]
+    return strong, missing
 
-# Команда /start
-@bot.message_handler(commands=['start'])
-def start(message):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    first_name = message.from_user.first_name
-    last_name = message.from_user.last_name
-    
-    # Сохраняем пользователя
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''INSERT OR IGNORE INTO users 
-                 (user_id, username, first_name, last_name, registration_date)
-                 VALUES (?, ?, ?, ?, ?)''',
-              (user_id, username, first_name, last_name, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-    
-    # Создаем клавиатуру
-    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    btn1 = types.KeyboardButton('🌟 Матрица судьбы')
-    btn2 = types.KeyboardButton('💕 Совместимость')
-    btn3 = types.KeyboardButton('✨ PRO подписка')
-    btn4 = types.KeyboardButton('🆘 Помощь')
-    markup.add(btn1, btn2, btn3, btn4)
-    
-    welcome_text = f"""Привет, {first_name}! 🌟
+def finance_code(d: datetime):
+    date_str = d.strftime("%d%m%Y")
+    root = reduce_to_1_9(digit_sum(int(date_str)))
+    return date_str, root
 
-Я - твой личный астролог! Я помогу тебе:
-🔮 Рассчитать матрицу судьбы
-💕 Узнать совместимость с партнером
-✨ Получить доступ к PRO-функциям
+def daily_number(date: datetime) -> int:
+    day_sum = digit_sum(date.day)
+    month_sum = digit_sum(date.month)
+    total = day_sum + month_sum
+    return reduce_to_1_9(total)
 
-Выбери действие в меню ниже 👇"""
+# ==== ОПИСАНИЯ ====
+CONSCIOUSNESS_DESC = {
+    1: {"plus": "Лидерство, решительность, энергия", "minus": "Упрямство, эгоцентричность", "nuance": "Слышать других и не давить."},
+    2: {"plus": "Дипломатия, партнёрство, мягкость", "minus": "Неуверенность, зависимость", "nuance": "Развивать самостоятельность."},
+    3: {"plus": "Креатив, самовыражение, харизма", "minus": "Поверхностность, хаос", "nuance": "Дисциплина для идей."},
+    4: {"plus": "Справедливость, система, новаторство", "minus": "Незавершённость, перегруз", "nuance": "Структура и финиш задач."},
+    5: {"plus": "Свобода, коммуникация, гибкость", "minus": "Разбросанность, бунт", "nuance": "Ответственность и завершение."},
+    6: {"plus": "Забота, ответственность, красота внешняя и внутренняя", "minus": "Жертвенность, контроль", "nuance": "Здоровые границы."},
+    7: {"plus": "Глубина, интуиция, анализ", "minus": "Замкнутость, хаос", "nuance": "Доверие и осознанность."},
+    8: {"plus": "Сила, управление, амбиции", "minus": "Жёсткость, давление", "nuance": "Мудрое лидерство."},
+    9: {"plus": "Гуманизм, миссия, завершение", "minus": "Идеализм, выгорание", "nuance": "Практичность и мера."},
+    11: {"plus": "Интуиция, вдохновение, духовное лидерство", "minus": "Тревожность, перфекционизм", "nuance": "Доверять интуиции, но сохранять связь с реальностью."},
+    22: {"plus": "Креатив, трансформация, строительство", "minus": "Перегрузка, давление", "nuance": "Использовать силу для созидания."},
+    33: {"plus": "Служение, любовь, исцеление", "minus": "Жертвенность, выгорание", "nuance": "Забота о себе = забота о мире."}
+}
 
-    bot.send_message(user_id, welcome_text, reply_markup=markup)
+MISSION_DESC = {
+    1: {"plus": "Воля, цельность", "minus": "Эго и жёсткость", "goal": "Учиться вести мягко."},
+    2: {"plus": "Гармония, дипломатия", "minus": "Зависимость", "goal": "Баланс и самостоятельность."},
+    3: {"plus": "Идеи, радость", "minus": "Расфокус", "goal": "Дисциплина для творчества."},
+    4: {"plus": "Структура, фундамент", "minus": "Застревание", "goal": "Гибкость и финиш задач."},
+    5: {"plus": "Перемены, свобода", "minus": "Хаос", "goal": "Свобода с ответственностью."},
+    6: {"plus": "Ответственность, забота", "minus": "Перегруз", "goal": "Границы и баланс."},
+    7: {"plus": "Смысл, мудрость", "minus": "Кризисы", "goal": "Доверие и осознанность."},
+    8: {"plus": "Результат, масштаб", "minus": "Контроль", "goal": "Этика + эффективность."},
+    9: {"plus": "Служение, завершение", "minus": "Выгорание", "goal": "Практичность."},
+    11: {"plus": "Вдохновение, интуиция", "minus": "Тревожность", "goal": "Вдохновлять и реализовывать."},
+    22: {"plus": "Трансформация", "minus": "Перегрузка", "goal": "Строить на благо."},
+    33: {"plus": "Служение", "minus": "Выгорание", "goal": "Любить и созидать."}
+}
 
-# Обработка текстовых сообщений
-@bot.message_handler(content_types=['text'])
-def handle_text(message):
-    user_id = message.from_user.id
-    text = message.text
-    
-    if text == '🌟 Матрица судьбы':
-        markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
-        btn_back = types.KeyboardButton('🔙 Назад')
-        markup.add(btn_back)
-        bot.send_message(user_id, "Введите вашу дату рождения в формате ДД.ММ.ГГГГ (например, 15.05.1990):", reply_markup=markup)
-        bot.register_next_step_handler(message, process_birth_date_for_matrix)
-    
-    elif text == '💕 Совместимость':
-        bot.send_message(user_id, "Введите дату рождения партнера в формате ДД.ММ.ГГГГ:")
-        bot.register_next_step_handler(message, process_partner_birth_date)
-    
-    elif text == '✨ PRO подписка':
-        show_pro_subscription(user_id)
-    
-    elif text == '🆘 Помощь':
-        help_text = """🔮 Как пользоваться ботом:
+ACTION_DESC = {
+    1: {"plus": "Решительность, напор", "minus": "Грубость", "title": "Действует прямо и быстро."},
+    2: {"plus": "Согласование, мирность", "minus": "Колебания", "title": "Через сотрудничество и баланс."},
+    3: {"plus": "Динамика, креатив", "minus": "Хаос", "title": "Через идеи и движение."},
+    4: {"plus": "Система, шаги", "minus": "Застревание", "title": "Через порядок и дисциплину."},
+    5: {"plus": "Гибкость, скорость", "minus": "Раздрай", "title": "Через перемены и общение."},
+    6: {"plus": "Ответственность, забота", "minus": "Перегруз", "title": "Через красоту и поддержку."},
+    7: {"plus": "Аналитика, интуиция", "minus": "Изоляция", "title": "Через смысл и глубину."},
+    8: {"plus": "Сила, управление", "minus": "Давление", "title": "Через цель и результат."},
+    9: {"plus": "Миссия, гуманизм", "minus": "Идеализм", "title": "Через завершение и пользу."}
+}
 
-1️⃣ Матрица судьбы - узнай свои сильные стороны и миссию
-2️⃣ Совместимость - проверь совместимость с партнером
-3️⃣ PRO подписка - доступ к расширенным функциям
+FINANCE_NOTES = {
+    1: "Деньги через личную инициативу и лидерство. Риск — давить.",
+    2: "Деньги через партнёрства и доверие. Риск — зависимость.",
+    3: "Деньги через креатив и контент. Риск — хаос.",
+    4: "Деньги через систему и процессы. Риск — незавершённость.",
+    5: "Деньги через маркетинг и перемены. Риск — расфокус.",
+    6: "Деньги через красоту и заботу. Риск — перегруз.",
+    7: "Деньги через знания и аналитику. Риск — кризисы.",
+    8: "Деньги через управление и масштаб. Риск — жёсткость.",
+    9: "Деньги через миссию и пользу людям. Риск — выгорание."
+}
 
+MATRIX_MEANINGS = {
+    1: "Лидерство, воля, решительность",
+    2: "Дипломатия, партнёрство, мягкость",
+    3: "Креатив, самовыражение, харизма",
+    4: "Система, дисциплина, порядок",
+    5: "Гибкость, перемены, свобода",
+    6: "Забота, ответственность, красота",
+    7: "Интуиция, анализ, глубина",
+    8: "Амбиции, управление, сила",
+    9: "Миссия, гуманизм, завершение"
+}
 
+GROWTH_TIPS = {
+    1: "Учиться мягкому лидерству и договариваться.",
+    2: "Отстаивать свои границы и самостоятельность.",
+    3: "Прокачивать регулярное самовыражение.",
+    4: "Выстраивать порядок и доводить до конца.",
+    5: "Фокус и завершение: меньше задач — больше качества.",
+    6: "Забота о себе наравне с заботой о других.",
+    7: "Доверие к миру, дневник наблюдений.",
+    8: "Мягкая сила: ответственность без давления.",
+    9: "Практичность: доводить миссию до результата."
+}
 
-💫 С любовью, твой астролог"""
-        bot.send_message(user_id, help_text)
-    
-    elif text == '🔙 Назад':
-        start(message)
+def get_consciousness_desc(number: int) -> str:
+    c = CONSCIOUSNESS_DESC.get(number, {})
+    return f"✅ {c.get('plus', '—')}\n❌ {c.get('minus', '—')}\n💡 {c.get('nuance', '—')}"
 
-# Обработка даты для матрицы
-def process_birth_date_for_matrix(message):
-    user_id = message.from_user.id
-    birth_date = message.text.strip()
-    
-    # Проверяем формат
-    if not validate_date(birth_date):
-        bot.send_message(user_id, "❌ Неверный формат! Используйте ДД.ММ.ГГГГ")
-        start(message)
-        return
-    
-    # Проверяем, есть ли у пользователя PRO подписка
-    if not check_premium(user_id):
-        # Ограничение для бесплатных пользователей
-        conn = sqlite3.connect('users.db')
-        c = conn.cursor()
-        c.execute('''SELECT COUNT(*) FROM fate_matrix 
-                     WHERE user_id = ? AND date(calculation_date) = date(?)''',
-                  (user_id, datetime.now().isoformat()))
-        count = c.fetchone()[0]
-        conn.close()
-        
-        if count >= 2:
-            bot.send_message(user_id, "⚠️ Бесплатный лимит: 2 расчета в день. Купи PRO подписку для безлимита!")
-            return
-    
-    # Рассчитываем матрицу
-    matrix = calculate_fate_matrix(birth_date)
-    if not matrix:
-        bot.send_message(user_id, "❌ Ошибка расчета. Проверьте правильность даты.")
-        return
-    
-    # Сохраняем результат
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''INSERT OR REPLACE INTO fate_matrix 
-                 (user_id, birth_date, matrix_data, calculation_date)
-                 VALUES (?, ?, ?, ?)''',
-              (user_id, birth_date, json.dumps(matrix), datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-    
-    # Формируем ответ
-    response = f"""🔮 ВАША МАТРИЦА СУДЬБЫ
+def get_mission_desc(number: int) -> str:
+    m = MISSION_DESC.get(number, {})
+    return f"✅ {m.get('plus', '—')}\n❌ {m.get('minus', '—')}\n🎯 {m.get('goal', '—')}"
 
-📅 Дата рождения: {birth_date}
+def get_action_desc(number: int) -> str:
+    a = ACTION_DESC.get(number, {})
+    return f"✅ {a.get('plus', '—')}\n❌ {a.get('minus', '—')}\n💡 {a.get('title', '—')}"
 
-🌟 Главное число: {matrix['main_number']}
-🎯 Миссия: {matrix['mission']}
+def get_finance_desc(number: int) -> str:
+    return FINANCE_NOTES.get(number, "Описание отсутствует.")
 
-💪 Ваши сильные стороны:
-{chr(10).join(f'• {s}' for s in matrix['strengths'])}
+def get_strong_desc(numbers: List[int]) -> str:
+    parts = [f"<b>{n}</b> — {MATRIX_MEANINGS.get(n, '—')}" for n in sorted(numbers) if n in MATRIX_MEANINGS]
+    return "\n".join(parts) if parts else "Сильные стороны не определены."
 
-⚠️ Ваши вызовы:
-{chr(10).join(f'• {c}' for c in matrix['challenges'])}
+def get_missing_desc(numbers: List[int]) -> str:
+    parts = [f"<b>{n}</b> — {GROWTH_TIPS.get(n, '—')}" for n in sorted(numbers) if n in GROWTH_TIPS]
+    return "\n".join(parts) if parts else "Зоны роста не определены."
 
-💫 Число личности: {matrix['personality_number']}
-🕊️ Число души: {matrix['soul_number']}
-🌍 Число судьбы: {matrix['destiny_number']}
-
-✨ Хотите более подробный разбор? Купите PRO подписку!
-"""
-    bot.send_message(user_id, response)
-
-# Обработка даты партнера для совместимости
-def process_partner_birth_date(message):
-    user_id = message.from_user.id
-    partner_birth = message.text.strip()
-    
-    if not validate_date(partner_birth):
-        bot.send_message(user_id, "❌ Неверный формат! Используйте ДД.ММ.ГГГГ")
-        return
-    
-    # Проверяем PRO подписку
-    if not check_premium(user_id):
-        # Для бесплатных - ограничение на 1 расчет в день
-        conn = sqlite3.connect('users.db')
-        c = conn.cursor()
-        c.execute('''SELECT COUNT(*) FROM compatibility 
-                     WHERE user_id = ? AND date(calculation_date) = date(?)''',
-                  (user_id, datetime.now().isoformat()))
-        count = c.fetchone()[0]
-        conn.close()
-        
-        if count >= 1:
-            bot.send_message(user_id, "⚠️ Бесплатный лимит: 1 расчет совместимости в день. Купи PRO!")
-            return
-    
-    # Просим ввести свою дату
-    bot.send_message(user_id, "Теперь введите ВАШУ дату рождения (ДД.ММ.ГГГГ):")
-    bot.register_next_step_handler(message, process_user_birth_for_compatibility, partner_birth)
-
-def process_user_birth_for_compatibility(message, partner_birth):
-    user_id = message.from_user.id
-    user_birth = message.text.strip()
-    
-    if not validate_date(user_birth):
-        bot.send_message(user_id, "❌ Неверный формат!")
-        return
-    
-    # Рассчитываем совместимость
-    result = calculate_compatibility(user_birth, partner_birth)
-    if not result:
-        bot.send_message(user_id, "❌ Ошибка расчета. Попробуйте еще раз.")
-        return
-    
-    # Сохраняем результат
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''INSERT OR REPLACE INTO compatibility 
-                 (user_id, partner_birth_date, result, calculation_date)
-                 VALUES (?, ?, ?, ?)''',
-              (user_id, partner_birth, json.dumps(result), datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-    
-    # Формируем ответ
-    stars = "⭐" * (result['score'] // 2) if result['score'] > 0 else "⭐"
-    response = f"""💕 СОВМЕСТИМОСТЬ
-
-📅 Ваша дата: {user_birth}
-📅 Дата партнера: {partner_birth}
-
-Совместимость: {result['score']}/10
-{stars}
-
-📝 {result['interpretation']}
-
-🔍 Детали: {result['details']}
-
-💫 Хотите полный гороскоп совместимости? Купите PRO!
-"""
-    bot.send_message(user_id, response)
-
-def validate_date(date_str):
-    try:
-        parts = date_str.split('.')
-        if len(parts) != 3:
-            return False
-        day, month, year = map(int, parts)
-        if 1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= 2025:
-            # Простая проверка на существование даты
-            datetime(year, month, day)
-            return True
-    except:
-        pass
-    return False
-
-def check_premium(user_id):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''SELECT subscription_end FROM users WHERE user_id = ?''', (user_id,))
-    result = c.fetchone()
-    conn.close()
-    
-    if not result or not result[0]:
-        return False
-    
-    try:
-        end_date = datetime.fromisoformat(result[0])
-        return end_date > datetime.now()
-    except:
-        return False
-
-def show_pro_subscription(user_id):
-    is_premium = check_premium(user_id)
-    
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    btn1 = types.InlineKeyboardButton("💳 Купить PRO на месяц (199 руб)", callback_data="pro_month")
-    btn2 = types.InlineKeyboardButton("💳 Купить PRO на год (1999 руб)", callback_data="pro_year")
-    btn_back = types.InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")
-    markup.add(btn1, btn2, btn_back)
-    
-    if is_premium:
-        status = "✅ У вас уже есть PRO подписка!"
+# ==== ГЛАВНОЕ МЕНЮ С КНОПКАМИ ====
+def main_menu(is_pro: bool = False) -> InlineKeyboardMarkup:
+    if is_pro:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Моя карта", callback_data="card"),
+             InlineKeyboardButton("❤️ Совместимость", callback_data="compat")],
+            [InlineKeyboardButton("✨ Практики роста", callback_data="practices"),
+             InlineKeyboardButton("📚 Личный гайд", callback_data="guide")],
+            [InlineKeyboardButton("🎬 Книги и фильмы", callback_data="media"),
+             InlineKeyboardButton("📝 Мини-тест", callback_data="test")],
+            [InlineKeyboardButton("🤖 Спросить AI", callback_data="ask_ai"),
+             InlineKeyboardButton("📅 Календарь", callback_data="calendar")],
+            [InlineKeyboardButton("🗑 Очистить историю", callback_data="clear_history"),
+             InlineKeyboardButton("👤 Профиль", callback_data="profile")]
+        ])
     else:
-        status = "🔓 У вас бесплатная версия"
-    
-    text = f"""✨ PRO ПОДПИСКА
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Моя карта", callback_data="card")],
+            [InlineKeyboardButton("❤️ Совместимость 🔒", callback_data="compat"),
+             InlineKeyboardButton("✨ Практики роста 🔒", callback_data="practices")],
+            [InlineKeyboardButton("📚 Личный гайд 🔒", callback_data="guide"),
+             InlineKeyboardButton("🎬 Книги и фильмы 🔒", callback_data="media")],
+            [InlineKeyboardButton("📝 Мини-тест 🔒", callback_data="test"),
+             InlineKeyboardButton("🤖 AI 🔒", callback_data="ask_ai")],
+            [InlineKeyboardButton("📅 Календарь 🔒", callback_data="calendar"),
+             InlineKeyboardButton("👤 Профиль", callback_data="profile")],
+            [InlineKeyboardButton("⭐ Оформить PRO", callback_data="subscription")]
+        ])
 
-{status}
+def back_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]])
 
-⭐ Преимущества PRO:
-• Безлимитные расчеты матрицы
-• Неограниченная совместимость
-• Полный детальный разбор
-• Приоритетная поддержка
+# ==== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====
+def build_user_profile_context(user_id: int) -> str:
+    user = db.get_user(user_id)
+    if not user or not user.get('birthdate'):
+        return ""
+    d = datetime.strptime(user['birthdate'], "%d.%m.%Y")
+    cn = consciousness_number(d.day)
+    ms = mission_number(d)
+    act = action_number(d)
+    strong, missing = matrix_counts(d)
+    fcode, froot = finance_code(d)
+    return (
+        f"Имя: {user['name']}\n"
+        f"Дата рождения: {user['birthdate']}\n"
+        f"Число Сознания: {cn}\n"
+        f"Число Миссии: {ms}\n"
+        f"Стиль действия: {act}\n"
+        f"Сильные числа: {strong}\n"
+        f"Зоны роста: {missing}\n"
+        f"Финансовый код: {fcode} (корень: {froot})\n"
+    )
 
-💰 Стоимость:
-• 1 месяц - 199 руб
-• 1 год - 1999 руб
+def build_full_report(name: str, d: datetime) -> str:
+    day_raw = d.day
+    cn = consciousness_number(d.day)
+    ms = mission_number(d)
+    act = action_number(d)
+    strong, missing = matrix_counts(d)
+    fcode, froot = finance_code(d)
+    c = CONSCIOUSNESS_DESC.get(cn, {})
+    m = MISSION_DESC.get(ms, {})
+    a = ACTION_DESC.get(act, {})
+    strong_lines = [f"• <b>{x}</b> — {MATRIX_MEANINGS.get(x, '—')}" for x in strong]
+    growth_lines = [f"• <b>{x}</b> — {GROWTH_TIPS.get(x, 'Нарабатывай постепенно.')}" for x in missing]
+    f_note = FINANCE_NOTES.get(froot, "")
+    return (
+        f"👋 <b>{name}</b>, вот твой персональный нумерологический отчёт\n"
+        f"📅 Дата рождения: <b>{d.strftime('%d.%m.%Y')}</b>\n\n"
+        f"🔑 <b>Число Сознания: {day_raw} → {cn}</b>\n"
+        f"• ✅ {c.get('plus', '—')}\n"
+        f"• ❌ {c.get('minus', '—')}\n"
+        f"• 💡 {c.get('nuance', '—')}\n\n"
+        f"🌟 <b>Миссия: {ms}</b>\n"
+        f"• ✅ {m.get('plus', '—')}\n"
+        f"• ❌ {m.get('minus', '—')}\n"
+        f"• 🎯 {m.get('goal', '—')}\n\n"
+        f"🧭 <b>Стиль действия: {act}</b>\n"
+        f"• ✅ {a.get('plus', '—')}\n"
+        f"• ❌ {a.get('minus', '—')}\n"
+        f"• 💡 {a.get('title', '—')}\n\n"
+        f"✨ <b>Сильные стороны:</b>\n" + ("\n".join(strong_lines) if strong_lines else "—") + "\n\n"
+        f"🎯 <b>Зоны роста:</b>\n" + ("\n".join(growth_lines) if growth_lines else "—") + "\n\n"
+        f"💰 <b>Финансовый код: {fcode}</b> (корень: {froot})\n" + (f"• {f_note}" if f_note else "")
+    )
 
-💳 Оплата через ЮKassa
-"""
-    bot.send_message(user_id, text, reply_markup=markup)
+def ask_deepseek_ai(prompt: str, user_id: int = None, max_tokens: int = 1500, use_history: bool = True) -> str:
+    if not DEEPSEEK_API_KEY:
+        return "⚠️ API-ключ DeepSeek не настроен. Добавь DEEPSEEK_API_KEY в переменные окружения."
+    try:
+        url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+        messages = [{"role": "system", "content": "Ты — цифровой психолог-нумеролог. Отвечай в формате Telegram-HTML."}]
+        messages.append({"role": "user", "content": prompt})
+        data = {"model": "deepseek-chat", "messages": messages, "max_tokens": max_tokens, "temperature": 0.7}
+        response = requests.post(url, headers=headers, json=data, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        return result["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.error(f"DeepSeek API Error: {e}")
+        return f"⚠️ Ошибка при запросе к AI: {str(e)}"
 
-# Обработка инлайн-кнопок
-@bot.callback_query_handler(func=lambda call: True)
-def callback_handler(call):
-    user_id = call.from_user.id
-    data = call.data
-    
-    if data == "back_to_menu":
-        bot.delete_message(user_id, call.message.message_id)
-        start(call.message)
-    
-    elif data in ["pro_month", "pro_year"]:
-        # Здесь логика оплаты через ЮKassa
-        amount = 199 if data == "pro_month" else 1999
-        period = "месяц" if data == "pro_month" else "год"
-        
-        # Создаем платеж (упрощенная версия)
-        payment_url = f"https://yoomoney.ru/quickpay/confirm.xml?receiver={YUKASSA_SHOP_ID}&quickpay-form=button&targets=PRO+подписка&sum={amount}&comment={user_id}"
-        
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        btn_pay = types.InlineKeyboardButton("💳 Оплатить", url=payment_url)
-        btn_check = types.InlineKeyboardButton("✅ Проверить оплату", callback_data="check_payment")
-        btn_back = types.InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")
-        markup.add(btn_pay, btn_check, btn_back)
-        
-        bot.edit_message_text(
-            f"💳 ОПЛАТА PRO ПОДПИСКИ\n\nСумма: {amount} руб\nПериод: {period}\n\nНажмите кнопку для оплаты:",
-            user_id,
-            call.message.message_id,
-            reply_markup=markup
+# ==== ОБРАБОТЧИКИ КОМАНД ====
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    db.create_user(user_id, username)
+    user = db.get_user(user_id)
+    if user and user.get('name') and user.get('birthdate'):
+        is_pro = db.is_pro_user(user_id)
+        await update.message.reply_text(
+            f"👋 С возвращением, <b>{user['name']}</b>!\n\nВыбери нужный раздел:",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=main_menu(is_pro)
         )
+        return
+    db.update_user(user_id, state='awaiting_name')
+    await update.message.reply_text(
+        "👋 <b>Привет! Я твой бот-нумеролог</b>\n\n"
+        "📝 Для начала, как к тебе обращаться? Напиши своё имя:",
+        parse_mode=constants.ParseMode.HTML
+    )
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db.update_user(user_id, state='idle')
+    is_pro = db.is_pro_user(user_id)
+    await update.message.reply_text(
+        "🏠 <b>Главное меню</b>",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=main_menu(is_pro)
+    )
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+    user = db.get_user(user_id)
+    if not user:
+        db.create_user(user_id, update.effective_user.username)
+        user = db.get_user(user_id)
+    state = user.get('state', 'idle')
     
-    elif data == "check_payment":
-        # Проверка оплаты (упрощенная)
-        # В реальности здесь был бы запрос к API ЮKassa
-        bot.answer_callback_query(call.id, "⏳ Проверяем оплату...")
-        bot.send_message(user_id, "✅ Оплата подтверждена! PRO подписка активирована на месяц.")
-        
-        # Активируем подписку
-        conn = sqlite3.connect('users.db')
-        c = conn.cursor()
-        end_date = datetime.now() + timedelta(days=30)
-        c.execute('''UPDATE users SET subscription_end = ?, is_premium = 1 WHERE user_id = ?''',
-                  (end_date.isoformat(), user_id))
-        conn.commit()
-        conn.close()
+    if state == 'awaiting_name':
+        if len(text) > 50:
+            await update.message.reply_text("❌ Имя слишком длинное. Попробуй ещё раз:")
+            return
+        db.update_user(user_id, name=text, state='awaiting_birthdate')
+        await update.message.reply_text(
+            f"Отлично, <b>{text}</b>! 👍\n\nТеперь введи дату рождения в формате <b>ДД.ММ.ГГГГ</b>\nНапример: 22.06.1995",
+            parse_mode=constants.ParseMode.HTML
+        )
+        return
+    
+    if state == 'awaiting_birthdate':
+        birthdate = parse_date(text)
+        if not birthdate:
+            await update.message.reply_text(
+                "❌ Неверный формат даты.\n\nВведи дату в формате <b>ДД.ММ.ГГГГ</b>",
+                parse_mode=constants.ParseMode.HTML
+            )
+            return
+        if birthdate.year < 1900 or birthdate > datetime.now():
+            await update.message.reply_text("❌ Некорректная дата рождения. Попробуй ещё раз:")
+            return
+        db.update_user(user_id, birthdate=text, state='idle')
+        db.log_action(user_id, 'registration_complete')
+        user = db.get_user(user_id)
+        d = datetime.strptime(user['birthdate'], "%d.%m.%Y")
+        report = build_full_report(user['name'], d)
+        await update.message.reply_text(report, parse_mode=constants.ParseMode.HTML)
+        is_pro = db.is_pro_user(user_id)
+        await update.message.reply_text(
+            "✅ <b>Регистрация завершена!</b>\n\nВыбери нужный раздел:",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=main_menu(is_pro)
+        )
+        return
+    
+    await update.message.reply_text(
+        "Я тебя слышу! 😊\n\nЧтобы получить отчёт, напиши /start\nЧтобы открыть меню, нажми /menu"
+    )
 
-# Обработка ошибок
-@bot.message_handler(func=lambda message: True)
-def handle_unknown(message):
-    bot.send_message(message.from_user.id, "❓ Я не понял. Используйте меню для навигации.")
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    callback_data = query.data
+    user = db.get_user(user_id)
+    if not user:
+        db.create_user(user_id, query.from_user.username)
+        user = db.get_user(user_id)
+    is_pro = db.is_pro_user(user_id)
+    
+    if callback_data == "menu":
+        await query.message.reply_text("🏠 <b>Главное меню</b>", parse_mode=constants.ParseMode.HTML, reply_markup=main_menu(is_pro))
+        return
+    
+    if not user.get('birthdate'):
+        await query.message.reply_text("⚠️ Сначала пройди регистрацию: /start", reply_markup=back_menu())
+        return
+    
+    pro_required = ['compat', 'practices', 'guide', 'media', 'test', 'ask_ai', 'calendar']
+    if callback_data in pro_required and not is_pro:
+        await query.message.reply_text(
+            "🔒 Этот раздел доступен только в PRO версии.\n\n⭐ Оформи подписку!",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=main_menu(is_pro)
+        )
+        return
+    
+    if callback_data == "card":
+        d = datetime.strptime(user['birthdate'], "%d.%m.%Y")
+        report = build_full_report(user['name'], d)
+        await query.message.reply_text(report, parse_mode=constants.ParseMode.HTML, reply_markup=back_menu())
+        return
+    
+    if callback_data == "compat":
+        await query.message.reply_text(
+            "❤️ <b>Совместимость</b>\n\nВведи дату рождения партнёра в формате <b>ДД.ММ.ГГГГ</b>",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+    
+    if callback_data == "practices":
+        await query.message.reply_text("✨ <b>Практики роста</b>\n\nСкоро здесь будут персональные рекомендации!", parse_mode=constants.ParseMode.HTML, reply_markup=back_menu())
+        return
+    
+    if callback_data == "guide":
+        await query.message.reply_text("📚 <b>Личный гайд</b>\n\nСкоро здесь будет твой план развития!", parse_mode=constants.ParseMode.HTML, reply_markup=back_menu())
+        return
+    
+    if callback_data == "media":
+        await query.message.reply_text("🎬 <b>Книги и фильмы</b>\n\nСкоро здесь будут рекомендации!", parse_mode=constants.ParseMode.HTML, reply_markup=back_menu())
+        return
+    
+    if callback_data == "test":
+        await query.message.reply_text("📝 <b>Мини-тест</b>\n\nСкоро здесь будет тест!", parse_mode=constants.ParseMode.HTML, reply_markup=back_menu())
+        return
+    
+    if callback_data == "ask_ai":
+        await query.message.reply_text(
+            "🤖 <b>Спросить AI</b>\n\nЗадай любой вопрос о своей личности, отношениях, карьере.",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+    
+    if callback_data == "calendar":
+        await query.message.reply_text("📅 <b>Календарь</b>\n\nСкоро здесь будет твой календарь!", parse_mode=constants.ParseMode.HTML, reply_markup=back_menu())
+        return
+    
+    if callback_data == "profile":
+        status = "⭐ PRO" if is_pro else "🆓 FREE"
+        await query.message.reply_text(
+            f"👤 <b>Профиль</b>\n\nИмя: {user['name']}\nДата рождения: {user['birthdate']}\nСтатус: {status}",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+    
+    if callback_data == "clear_history":
+        await query.message.reply_text("🗑 История диалога очищена!", parse_mode=constants.ParseMode.HTML, reply_markup=back_menu())
+        return
+    
+    if callback_data == "subscription":
+        await query.message.reply_text(
+            "⭐ <b>PRO подписка</b>\n\n"
+            "✅ Безлимит запросов\n"
+            "✅ AI с памятью\n"
+            "✅ Совместимость\n"
+            "✅ Практики и рекомендации\n"
+            "✅ Книги и фильмы\n"
+            "✅ Календарь\n\n"
+            "💳 1 месяц — 199₽\n"
+            "💳 1 год — 1990₽",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
 
-# ... весь твой код бота (обработчики, функции, логика) ...
-
-# ===== ДОБАВЛЯЕМ ЭТУ ФУНКЦИЮ =====
+# ==== ЗАПУСК БОТА ====
 def main():
-    """Запуск бота через функцию main для совместимости с Render"""
-    init_db()
-    logger.info("🚀 Бот запущен через main()")
-    while True:
-        try:
-            bot.polling(none_stop=True, interval=0)
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            time.sleep(10)
+    logger.info("🚀 Запуск бота...")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    logger.info("✅ Бот успешно запущен!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# ===== ЭТО УЖЕ БЫЛО (оставляем как есть) =====
-if __name__ == '__main__':
-    init_db()
-    logger.info("Бот запущен!")
-    while True:
-        try:
-            bot.polling(none_stop=True, interval=0)
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            time.sleep(10)
+if __name__ == "__main__":
+    main()
