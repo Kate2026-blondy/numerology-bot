@@ -521,7 +521,21 @@ def callback_handler(call):
 def handle_unknown(message):
     bot.send_message(message.from_user.id, "❓ Я не понял. Используйте меню для навигации.")
 
-# Запуск бота
+# ... весь твой код бота (обработчики, функции, логика) ...
+
+# ===== ДОБАВЛЯЕМ ЭТУ ФУНКЦИЮ =====
+def main():
+    """Запуск бота через функцию main для совместимости с Render"""
+    init_db()
+    logger.info("🚀 Бот запущен через main()")
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=0)
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+            time.sleep(10)
+
+# ===== ЭТО УЖЕ БЫЛО (оставляем как есть) =====
 if __name__ == '__main__':
     init_db()
     logger.info("Бот запущен!")
