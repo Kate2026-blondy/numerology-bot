@@ -2,6 +2,7 @@ import asyncio
 import sys
 import threading
 import os
+import time
 from flask import Flask
 import bot
 
@@ -21,11 +22,17 @@ def health():
 
 def run_flask():
     port = int(os.environ.get('PORT', 10000))
-    flask_app.run(host='0.0.0.0', port=port)
+    print(f"🚀 Запуск Flask на порту {port}...")
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    print("✅ Flask запущен на порту 10000")
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Даём Flask время запуститься
+    time.sleep(2)
+    print("✅ Flask запущен, теперь запускаем бота...")
     
     # Создаём event loop для бота
     loop = asyncio.new_event_loop()
