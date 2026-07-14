@@ -1,7 +1,13 @@
-from flask import Flask
-import os
+import asyncio
+import sys
 import threading
-import bot  # Импортируем нашего бота
+import os
+from flask import Flask
+import bot
+
+# Исправление для event loop
+if sys.platform == "win32" or sys.platform.startswith("linux"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 flask_app = Flask(__name__)
 
@@ -14,15 +20,18 @@ def health():
     return "OK", 200
 
 def run_flask():
-    """Запускает Flask-сервер для Render"""
     port = int(os.environ.get('PORT', 5000))
     flask_app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    # Запускаем Flask в отдельном потоке, чтобы он не блокировал бота
     threading.Thread(target=run_flask, daemon=True).start()
-    print("✅ Flask-сервер запущен в фоновом режиме")
-    
-    # Запускаем основную функцию бота из bot.py
-    print("🚀 Запуск бота...")
-    bot.main()
+    print("✅ Flask запущен")
+    try:
+        bot.main()
+    except RuntimeError as e:
+        if "event loop" in str(e):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            bot.main()
+        else:
+            raise
