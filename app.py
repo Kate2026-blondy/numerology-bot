@@ -5,9 +5,15 @@ import os
 from flask import Flask
 import bot
 
-# Исправление для event loop
-if sys.platform == "win32" or sys.platform.startswith("linux"):
+# Исправление для event loop на Linux
+if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+else:
+    # Для Linux используем стандартную политику
+    try:
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    except AttributeError:
+        pass
 
 flask_app = Flask(__name__)
 
@@ -26,6 +32,11 @@ def run_flask():
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     print("✅ Flask запущен")
+    
+    # Создаём event loop для бота
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     try:
         bot.main()
     except RuntimeError as e:
