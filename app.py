@@ -1,6 +1,7 @@
 from flask import Flask
 import os
 import threading
+import bot  # ← импортируем бота
 
 flask_app = Flask(__name__)
 
@@ -17,7 +18,7 @@ def run_flask():
     flask_app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    # Запускаем Flask в отдельном потоке, чтобы не мешать боту
+    # Запускаем Flask в отдельном потоке
     threading.Thread(target=run_flask, daemon=True).start()
-    # Запускаем основную функцию бота
-    main()
+    # Бот уже запущен через bot.py, не вызываем main()
+    print("✅ Бот и Flask запущены!")
