@@ -266,7 +266,7 @@ def handle_text(message):
 2️⃣ Совместимость - проверь совместимость с партнером
 3️⃣ PRO подписка - доступ к расширенным функциям
 
-❓ Вопросы: @Yana_Beauty_Store
+
 
 💫 С любовью, твой астролог"""
         bot.send_message(user_id, help_text)
