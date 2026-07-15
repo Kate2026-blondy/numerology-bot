@@ -25,33 +25,14 @@ def run_flask():
     print(f"🚀 Запуск Flask на порту {port}...")
     flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-def run_bot():
-    """Запуск бота с правильным event loop"""
-    try:
-        # Создаём новый event loop для бота
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        bot.main()
-    except Exception as e:
-        print(f"❌ Ошибка бота: {e}")
-        # Пробуем перезапустить
-        time.sleep(5)
-        run_bot()
-
 if __name__ == "__main__":
-    # Запускаем Flask в отдельном потоке
+    # Запускаем Flask в ОТДЕЛЬНОМ потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
     # Даём Flask время запуститься
     time.sleep(2)
-    print("✅ Flask запущен, теперь запускаем бота...")
+    print("✅ Flask запущен, теперь запускаем бота в главном потоке...")
     
-    # Запускаем бота в отдельном потоке
-    bot_thread = threading.Thread(target=run_bot, daemon=False)
-    bot_thread.start()
-    
-    # Держим главный поток живым
-    while True:
-        time.sleep(1)
-        
+    # Запускаем бота в ГЛАВНОМ потоке
+    bot.main()
