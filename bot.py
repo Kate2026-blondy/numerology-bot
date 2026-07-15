@@ -570,21 +570,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==== ЗАПУСК БОТА ====
 def main():
-    """Запуск бота"""
+    """Запуск бота в главном потоке"""
     logger.info("🚀 Запуск бота...")
+    
+    # Создаём приложение
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    
     logger.info("✅ Бот успешно запущен!")
     
-    # Запускаем polling с правильным asyncio
-    try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-    except Exception as e:
-        logger.error(f"Ошибка в run_polling: {e}")
-        raise
+    # Запускаем polling (это блокирует главный поток)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
