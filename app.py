@@ -6,7 +6,7 @@ import time
 from flask import Flask
 import bot
 
-# Создаём event loop принудительно для Python 3.14
+# Создаём event loop принудительно
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
@@ -26,6 +26,7 @@ def run_flask():
     flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
+    # Запускаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
@@ -37,4 +38,3 @@ if __name__ == "__main__":
         loop.run_until_complete(bot.main_async())
     except Exception as e:
         print(f"❌ Ошибка: {e}")
-        loop.run_until_complete(bot.main_async())
