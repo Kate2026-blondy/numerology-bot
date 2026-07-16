@@ -3,6 +3,11 @@ import time
 import threading
 from flask import Flask
 import subprocess
+import asyncio
+
+# Принудительно создаём event loop
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 flask_app = Flask(__name__)
 
@@ -19,21 +24,14 @@ def run_flask():
     print(f"🚀 Запуск Flask на порту {port}...")
     flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-def run_bot():
-    """Запускаем бота в отдельном процессе"""
-    print("🚀 Запуск бота в отдельном процессе...")
-    # Используем subprocess, чтобы бот работал в своём собственном процессе
-    subprocess.Popen(["python", "-c", 
-        "import bot; bot.main()"
-    ], stdout=None, stderr=None)
-
 if __name__ == "__main__":
-    # Запускаем бота в отдельном процессе (не потоке!)
-    run_bot()
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     
-    # Даём боту время запуститься
-    time.sleep(3)
+    time.sleep(2)
+    print("✅ Flask запущен")
     
-    # Запускаем Flask в основном потоке
-    run_flask()
-    
+    # Запускаем бота через subprocess (отдельный процесс)
+    print("🚀 Запуск бота...")
+    os.system("python -c \"import bot; bot.main()\"")
